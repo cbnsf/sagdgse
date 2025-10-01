@@ -1,120 +1,142 @@
-// api/airdrop.js
 import { Connection, PublicKey, Keypair, Transaction } from '@solana/web3.js';
-import { getAssociatedTokenAddress, createAssociatedTokenAccountInstruction, createTransferInstruction, TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import {
+  getAssociatedTokenAddress,
+  getAccount,
+  getOrCreateAssociatedTokenAccount,
+  getMint,
+  transferChecked,
+  TOKEN_PROGRAM_ID
+} from '@solana/spl-token';
+import bs58 from 'bs58';
 
-// 环境变量 - 需要在 Vercel 中设置
-const PRIVATE_KEY = JSON.parse(process.env.WALLET_PRIVATE_KEY || '[]');
-const TOKEN_MINT_ADDRESS = process.env.TOKEN_MINT_ADDRESS;
-const RPC_URL = process.env.RPC_URL || ''; // 先用 devnet 测试
+function loadSenderKeypairFromEnv() {
+  const raw = process.env.SENDER_SECRET_KEY;
+  if (!raw) throw new Error('SENDER_SECRET_KEY env missing');
 
-// 检查环境变量
-if (!PRIVATE_KEY.length || !TOKEN_MINT_ADDRESS) {
-  console.error('Missing required environment variables');
+  // 如果是 JSON 数组字符串 -> 解析为 Uint8Array
+  if (raw.trim().startsWith('[')) {
+    const arr = JSON.parse(raw);
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  }
+
+  // 其他情况视为 base58 编码的私钥
+  try {
+    const secret = bs58.decode(raw.trim());
+    return Keypair.fromSecretKey(secret);
+  } catch (e) {
+    throw new Error('Invalid SENDER_SECRET_KEY format. Use base58 or JSON array.');
+  }
 }
-
-const connection = new Connection(RPC_URL, 'confirmed');
-const wallet = Keypair.fromSecretKey(new Uint8Array(PRIVATE_KEY));
-const claimedAddresses = new Set();
 
 export default async function handler(req, res) {
   // 设置 CORS 头
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,POST');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  // 处理预检请求
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
 
-  // 只允许 POST 请求
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
+    return res.status(405).json({ success: false, error: 'Only POST supported' });
   }
 
   try {
-    const { walletAddress } = req.body;
-
+    const { walletAddress } = req.body || {};
     if (!walletAddress) {
-      return res.status(400).json({ error: 'Wallet address is required' });
+      return res.status(400).json({ success: false, error: 'walletAddress missing' });
     }
 
-    // 验证钱包地址
-    let recipient;
-    try {
-      recipient = new PublicKey(walletAddress);
-    } catch (error) {
-      return res.status(400).json({ error: 'Invalid wallet address' });
+    // ENV 必要项
+    const RPC_URL = process.env.SOLANA_RPC_URL;
+    const MINT_ADDR = process.env.TOKEN_MINT_ADDRESS;
+    const AIRDROP_AMOUNT = process.env.AIRDROP_AMOUNT || '25000';
+
+    if (!RPC_URL || !MINT_ADDR) {
+      return res.status(500).json({ 
+        success: false, 
+        error: 'SOLANA_RPC_URL and TOKEN_MINT_ADDRESS must be set in env' 
+      });
     }
 
-    // 检查是否已领取
-    if (claimedAddresses.has(walletAddress)) {
-      return res.status(400).json({ error: 'Airdrop already claimed' });
+    // 如果没有私钥配置，返回测试模式
+    if (!process.env.SENDER_SECRET_KEY) {
+      return res.status(200).json({
+        success: true,
+        message: 'Airdrop API is working! (Test mode - set SENDER_SECRET_KEY for real airdrop)',
+        walletAddress: walletAddress,
+        mode: 'test'
+      });
     }
 
-    const mint = new PublicKey(TOKEN_MINT_ADDRESS);
-    
-    // 获取代币账户地址
-    const fromTokenAccount = await getAssociatedTokenAddress(mint, wallet.publicKey);
-    const toTokenAccount = await getAssociatedTokenAddress(mint, recipient);
+    // 建立连接
+    const connection = new Connection(RPC_URL, 'confirmed');
 
-    const transaction = new Transaction();
+    // 读取发送者密钥对
+    const senderKeypair = loadSenderKeypairFromEnv();
 
-    // 检查接收者是否有代币账户
-    const toTokenAccountInfo = await connection.getAccountInfo(toTokenAccount);
-    if (!toTokenAccountInfo) {
-      // 如果没有，创建代币账户
-      transaction.add(
-        createAssociatedTokenAccountInstruction(
-          wallet.publicKey,
-          toTokenAccount,
-          recipient,
-          mint
-        )
-      );
-    }
+    // 公钥对象
+    const mintPubkey = new PublicKey(MINT_ADDR);
+    const recipientPubkey = new PublicKey(walletAddress);
 
-    // 添加转账指令 - 修正金额计算
-    const decimals = 9; // 假设代币有 6 位小数
-    const transferAmount = 25000 * Math.pow(10, decimals);
-    
-    transaction.add(
-      createTransferInstruction(
-        fromTokenAccount,
-        toTokenAccount,
-        wallet.publicKey,
-        transferAmount,
-        [],
-        TOKEN_PROGRAM_ID
-      )
+    // 读取 mint 信息，获取 decimals
+    const mintInfo = await getMint(connection, mintPubkey);
+    const decimals = mintInfo.decimals;
+
+    // 计算最小单位数量（BigInt）
+    const amountToken = BigInt(AIRDROP_AMOUNT);
+    const amountToSend = amountToken * (BigInt(10) ** BigInt(decimals));
+
+    // 获取或创建发送方的 ATA（作为源）
+    const senderPubkey = senderKeypair.publicKey;
+    const senderAta = await getOrCreateAssociatedTokenAccount(
+      connection, 
+      senderKeypair, 
+      mintPubkey, 
+      senderPubkey
     );
 
-    // 设置区块哈希和费用支付者
-    const { blockhash } = await connection.getLatestBlockhash();
-    transaction.recentBlockhash = blockhash;
-    transaction.feePayer = wallet.publicKey;
+    // 检查发送方余额
+    const senderAccount = await getAccount(connection, senderAta.address);
+    if (senderAccount.amount < amountToSend) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'insufficient_token_balance' 
+      });
+    }
 
-    // 签名并发送
-    transaction.sign(wallet);
-    const signature = await connection.sendRawTransaction(transaction.serialize());
-    
-    // 等待确认
-    await connection.confirmTransaction(signature, 'confirmed');
+    // 获取或创建接收方的 ATA
+    const recipientAta = await getOrCreateAssociatedTokenAccount(
+      connection, 
+      senderKeypair, 
+      mintPubkey, 
+      recipientPubkey
+    );
 
-    // 记录已领取
-    claimedAddresses.add(walletAddress);
+    // 执行 transferChecked
+    const signature = await transferChecked(
+      connection,
+      senderKeypair,
+      senderAta.address,
+      mintPubkey,
+      recipientAta.address,
+      senderPubkey,
+      amountToSend,
+      decimals
+    );
 
-    return res.status(200).json({
-      success: true,
+    return res.status(200).json({ 
+      success: true, 
       signature,
-      message: '25,000 DUCK tokens sent successfully!'
+      message: `${AIRDROP_AMOUNT} DUCK tokens sent successfully!`
     });
 
-  } catch (error) {
-    console.error('Airdrop error:', error);
+  } catch (err) {
+    console.error('Airdrop error:', err);
     return res.status(500).json({ 
-      error: 'Failed to process airdrop',
-      details: error.message
+      success: false, 
+      error: err.message || String(err) 
     });
   }
 }
